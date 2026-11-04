@@ -1,0 +1,132 @@
+# Language: YAML | File: .github/workflows/build-dylib.yml | Runtime: GitHub Actions (macos-latest) | Target: iOS arm64 (.dylib)
+name: Build iOS Dylib
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Theos & iOS SDK Environment
+        shell: bash
+        run: |
+          export THEOS=~/theos
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "$THEOS/bin" >> $GITHUB_PATH
+          
+          # Note: Clones Theos with submodules and pulls patched iOS SDKs supporting private frameworks; bypasses missing stock Xcode private headers
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          
+          curl -sL https://github.com/theos/sdks/archive/master.tar.gz | tar -xzf - -C $THEOS/sdks --strip-components=1
+
+      - name: Verify Toolchain & Locate Build Root
+        id: locate
+        shell: bash
+        run: |
+          # Note: Dynamically finds the directory containing Makefile if nested in a subfolder; prevents failure when repo root is a wrapper
+          MAKEFILE_PATH=$(find . -maxdepth 3 -name "Makefile" -not -path "./.git/*" | head -n 1)
+          if [ -n "$MAKEFILE_PATH" ]; then
+            BUILD_DIR=$(dirname "$MAKEFILE_PATH")
+            echo "mode=theos" >> $GITHUB_OUTPUT
+            echo "dir=$BUILD_DIR" >> $GITHUB_OUTPUT
+            echo "Found Makefile in: $BUILD_DIR"
+          else
+            echo "mode=clang" >> $GITHUB_OUTPUT
+            echo "dir=." >> $GITHUB_OUTPUT
+            echo "No Makefile found. Falling back to direct xcrun clang++ compilation."
+          fi
+
+      - name: Compile Dylib (Theos Mode)
+        if: steps.locate.outputs.mode == 'theos'
+        working-directory: ${{ steps.locate.outputs.dir }}
+        shell: bash
+        run: |
+          # Note: Forces arm64 slice, strips debug symbols, and disables warnings-as-errors; avoids build breaks on strict modern AppleClang versions
+          make clean
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless ARCHS="arm64" \
+            ADDITIONAL_CFLAGS="-Wno-error -Wno-deprecated-declarations -fvisibility=hidden" \
+            ADDITIONAL_OBJCFLAGS="-Wno-error -Wno-deprecated-declarations -fobjc-arc"
+
+      - name: Compile Dylib (Direct Clang Fallback Mode)
+        if: steps.locate.outputs.mode == 'clang'
+        shell: bash
+        run: |
+          mkdir -p build_out
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          
+          # Collect all source files excluding hidden/build directories
+          SOURCES=$(find . -type f \( -name "*.mm" -o -name "*.cpp" -o -name "*.m" -o -name "*.c" \) -not -path "./.git/*" -not -path "./build_out/*")
+          
+          # Collect all header search paths
+          INCLUDES=$(find . -type f \( -name "*.h" -o -name "*.hpp" \) -not -path "./.git/*" -exec dirname {} \; | sort -u | sed 's/^/-I/')
+          
+          # Collect precompiled static libraries (.a) like libdobby.a if present in repo
+          STATIC_LIBS=$(find . -type f -name "*.a" -not -path "./.git/*")
+          
+          # Collect custom frameworks (.framework) if present in repo
+          FRAMEWORK_DIRS=$(find . -type d -name "*.framework" -not -path "./.git/*" -exec dirname {} \; | sort -u | sed 's/^/-F/')
+          
+          # Note: Direct dynamic library compilation via AppleClang with @rpath install_name; works for standalone ESign/TrollStore dylib injection without Theos
+          xcrun -sdk iphoneos clang++ -arch arm64 \
+            -dynamiclib \
+            -isysroot "$SDK_PATH" \
+            -miphoneos-version-min=14.0 \
+            -std=c++17 \
+            -fobjc-arc \
+            -fvisibility=hidden \
+            -Wno-deprecated-declarations \
+            -Wno-unused-variable \
+            -install_name @rpath/OkLilw.dylib \
+            $INCLUDES \
+            $FRAMEWORK_DIRS \
+            $SOURCES \
+            $STATIC_LIBS \
+            -framework Foundation \
+            -framework UIKit \
+            -framework QuartzCore \
+            -framework CoreGraphics \
+            -framework Metal \
+            -framework MetalKit \
+            -framework Security \
+            -framework SystemConfiguration \
+            -framework WebKit \
+            -o build_out/OkLilw.dylib
+            
+          strip -x build_out/OkLilw.dylib
+          ldid -S build_out/OkLilw.dylib || codesign -f -s - build_out/OkLilw.dylib
+
+      - name: Collect Compiled Artifacts
+        shell: bash
+        run: |
+          mkdir -p artifacts_output
+          
+          # Extract .dylib from Theos obj/ or stage/ directories, or direct build_out/
+          find . -type f -name "*.dylib" -not -path "./artifacts_output/*" -exec cp -v {} artifacts_output/ \;
+          find . -type f -name "*.deb" -not -path "./artifacts_output/*" -exec cp -v {} artifacts_output/ \;
+          
+          ls -la artifacts_output/
+          if [ -z "$(ls -A artifacts_output/)" ]; then
+            echo "Error: No .dylib or .deb produced!"
+            exit 1
+          fi
+
+      - name: Upload Dylib & Package Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OkLilw-iOS-Dylib-${{ github.sha }}
+          path: |
+            artifacts_output/*.dylib
+            artifacts_output/*.deb
+          if-no-files-found: error
+          retention-days: 30
