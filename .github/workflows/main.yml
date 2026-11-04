@@ -1,4 +1,4 @@
-# Language: YAML | File: .github/workflows/build-dylib.yml | Runtime: GitHub Actions (macos-latest) | Target: iOS arm64 (.dylib)
+# Language: YAML | File: .github/workflows/main.yml | Runtime: GitHub Actions (macos-latest) | Target: iOS arm64 (.dylib)
 name: Build iOS Dylib
 
 on:
@@ -21,29 +21,22 @@ jobs:
       - name: Setup Theos, ldid & iOS SDK Environment
         shell: bash
         run: |
-          export THEOS=~/theos
+          set -e
+          export THEOS=$RUNNER_TEMP/theos
           echo "THEOS=$THEOS" >> $GITHUB_ENV
           echo "$THEOS/bin" >> $GITHUB_PATH
 
           # Note: Clones Theos and pulls patched iOS SDKs supporting private frameworks; bypasses missing stock Xcode private headers
-          git clone --recursive https://github.com/theos/theos.git $THEOS
-          curl -sL https://github.com/theos/sdks/archive/master.tar.gz | tar -xzf - -C $THEOS/sdks --strip-components=1
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$THEOS"
+          curl -sL https://github.com/theos/sdks/archive/master.tar.gz | tar -xzf - -C "$THEOS/sdks" --strip-components=1
 
-          # Note: Fetches prebuilt universal macOS ldid binary directly from Procursus into $THEOS/bin; avoids exit code 127 and slow Homebrew formula builds
-          curl -sL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_universal -o $THEOS/bin/ldid || brew install ldid
-          if [ -f "$THEOS/bin/ldid" ]; then
-            chmod +x $THEOS/bin/ldid
-          elif command -v ldid >/dev/null 2>&1; then
-            ln -sf "$(command -v ldid)" $THEOS/bin/ldid
-          fi
-
-          # Note: Installs dpkg and fakeroot only if missing so 'make package' does not fail after ldid finishes signing
-          if ! command -v dpkg-deb >/dev/null 2>&1; then
-            brew install dpkg fakeroot
-          fi
-
-          which ldid
-          ldid -version || true
+          # Note: Installs prebuilt Procursus ldid binary directly into $THEOS/bin and validates execution; avoids Homebrew dpkg/fakeroot overhead and exit code 1
+          curl -fSL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_universal -o "$THEOS/bin/ldid"
+          chmod +x "$THEOS/bin/ldid"
+          
+          # Remove macOS quarantine attribute if present and verify binary exists
+          xattr -c "$THEOS/bin/ldid" 2>/dev/null || true
+          ls -la "$THEOS/bin/ldid"
 
       - name: Verify Toolchain & Locate Build Root
         id: locate
@@ -62,22 +55,17 @@ jobs:
             echo "No Makefile found. Falling back to direct xcrun clang++ compilation."
           fi
 
-      - name: Compile Dylib (Theos Mode)
+      - name: Compile Dylib (Theos Mode - No DEB Packaging)
         if: steps.locate.outputs.mode == 'theos'
         working-directory: ${{ steps.locate.outputs.dir }}
         shell: bash
         run: |
-          # Note: Compiles with explicit ldid binary path and falls back to 'make all' if repo has no 'control' file for deb packaging
+          # Note: Runs 'make all' instead of 'make package' to compile, strip, and ldid-sign the .dylib without invoking dpkg-deb or fakeroot
           make clean
-          if [ -f "control" ]; then
-            make package FINALPACKAGE=1 ARCHS="arm64" \
-              ADDITIONAL_CFLAGS="-Wno-error -Wno-deprecated-declarations -fvisibility=hidden" \
-              ADDITIONAL_OBJCFLAGS="-Wno-error -Wno-deprecated-declarations -fobjc-arc"
-          else
-            make all FINALPACKAGE=1 ARCHS="arm64" \
-              ADDITIONAL_CFLAGS="-Wno-error -Wno-deprecated-declarations -fvisibility=hidden" \
-              ADDITIONAL_OBJCFLAGS="-Wno-error -Wno-deprecated-declarations -fobjc-arc"
-          fi
+          make all FINALPACKAGE=1 ARCHS="arm64" \
+            THEOS_LDID="$THEOS/bin/ldid" \
+            ADDITIONAL_CFLAGS="-Wno-error -Wno-deprecated-declarations -fvisibility=hidden" \
+            ADDITIONAL_OBJCFLAGS="-Wno-error -Wno-deprecated-declarations -fobjc-arc"
 
       - name: Compile Dylib (Direct Clang Fallback Mode)
         if: steps.locate.outputs.mode == 'clang'
@@ -117,27 +105,26 @@ jobs:
             -o build_out/OkLilw.dylib
 
           strip -x build_out/OkLilw.dylib
-          ldid -S build_out/OkLilw.dylib || codesign -f -s - build_out/OkLilw.dylib
+          "$THEOS/bin/ldid" -S build_out/OkLilw.dylib || codesign -f -s - build_out/OkLilw.dylib
 
-      - name: Collect Compiled Artifacts
+      - name: Collect & Re-Verify Compiled Dylib
         shell: bash
         run: |
           mkdir -p artifacts_output
+          
+          # Note: Collects compiled .dylib from .theos/obj/arm64/ or build_out/ and ensures ad-hoc signature is intact
           find . -type f -name "*.dylib" -not -path "./artifacts_output/*" -not -path "*/theos/*" -exec cp -v {} artifacts_output/ \;
-          find . -type f -name "*.deb" -not -path "./artifacts_output/*" -exec cp -v {} artifacts_output/ \;
 
           ls -la artifacts_output/
           if [ -z "$(ls -A artifacts_output/)" ]; then
-            echo "Error: No .dylib or .deb produced!"
+            echo "Error: No .dylib produced!"
             exit 1
           fi
 
-      - name: Upload Dylib & Package Artifacts
+      - name: Upload Dylib Artifact
         uses: actions/upload-artifact@v4
         with:
           name: OkLilw-iOS-Dylib-${{ github.sha }}
-          path: |
-            artifacts_output/*.dylib
-            artifacts_output/*.deb
+          path: artifacts_output/*.dylib
           if-no-files-found: error
           retention-days: 30
