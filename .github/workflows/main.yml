@@ -18,17 +18,32 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup Theos & iOS SDK Environment
+      - name: Setup Theos, ldid & iOS SDK Environment
         shell: bash
         run: |
           export THEOS=~/theos
           echo "THEOS=$THEOS" >> $GITHUB_ENV
           echo "$THEOS/bin" >> $GITHUB_PATH
-          
-          # Note: Clones Theos with submodules and pulls patched iOS SDKs supporting private frameworks; bypasses missing stock Xcode private headers
+
+          # Note: Clones Theos and pulls patched iOS SDKs supporting private frameworks; bypasses missing stock Xcode private headers
           git clone --recursive https://github.com/theos/theos.git $THEOS
-          
           curl -sL https://github.com/theos/sdks/archive/master.tar.gz | tar -xzf - -C $THEOS/sdks --strip-components=1
+
+          # Note: Fetches prebuilt universal macOS ldid binary directly from Procursus into $THEOS/bin; avoids exit code 127 and slow Homebrew formula builds
+          curl -sL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_universal -o $THEOS/bin/ldid || brew install ldid
+          if [ -f "$THEOS/bin/ldid" ]; then
+            chmod +x $THEOS/bin/ldid
+          elif command -v ldid >/dev/null 2>&1; then
+            ln -sf "$(command -v ldid)" $THEOS/bin/ldid
+          fi
+
+          # Note: Installs dpkg and fakeroot only if missing so 'make package' does not fail after ldid finishes signing
+          if ! command -v dpkg-deb >/dev/null 2>&1; then
+            brew install dpkg fakeroot
+          fi
+
+          which ldid
+          ldid -version || true
 
       - name: Verify Toolchain & Locate Build Root
         id: locate
@@ -52,11 +67,17 @@ jobs:
         working-directory: ${{ steps.locate.outputs.dir }}
         shell: bash
         run: |
-          # Note: Forces arm64 slice, strips debug symbols, and disables warnings-as-errors; avoids build breaks on strict modern AppleClang versions
+          # Note: Compiles with explicit ldid binary path and falls back to 'make all' if repo has no 'control' file for deb packaging
           make clean
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless ARCHS="arm64" \
-            ADDITIONAL_CFLAGS="-Wno-error -Wno-deprecated-declarations -fvisibility=hidden" \
-            ADDITIONAL_OBJCFLAGS="-Wno-error -Wno-deprecated-declarations -fobjc-arc"
+          if [ -f "control" ]; then
+            make package FINALPACKAGE=1 ARCHS="arm64" \
+              ADDITIONAL_CFLAGS="-Wno-error -Wno-deprecated-declarations -fvisibility=hidden" \
+              ADDITIONAL_OBJCFLAGS="-Wno-error -Wno-deprecated-declarations -fobjc-arc"
+          else
+            make all FINALPACKAGE=1 ARCHS="arm64" \
+              ADDITIONAL_CFLAGS="-Wno-error -Wno-deprecated-declarations -fvisibility=hidden" \
+              ADDITIONAL_OBJCFLAGS="-Wno-error -Wno-deprecated-declarations -fobjc-arc"
+          fi
 
       - name: Compile Dylib (Direct Clang Fallback Mode)
         if: steps.locate.outputs.mode == 'clang'
@@ -64,20 +85,12 @@ jobs:
         run: |
           mkdir -p build_out
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          
-          # Collect all source files excluding hidden/build directories
           SOURCES=$(find . -type f \( -name "*.mm" -o -name "*.cpp" -o -name "*.m" -o -name "*.c" \) -not -path "./.git/*" -not -path "./build_out/*")
-          
-          # Collect all header search paths
           INCLUDES=$(find . -type f \( -name "*.h" -o -name "*.hpp" \) -not -path "./.git/*" -exec dirname {} \; | sort -u | sed 's/^/-I/')
-          
-          # Collect precompiled static libraries (.a) like libdobby.a if present in repo
           STATIC_LIBS=$(find . -type f -name "*.a" -not -path "./.git/*")
-          
-          # Collect custom frameworks (.framework) if present in repo
           FRAMEWORK_DIRS=$(find . -type d -name "*.framework" -not -path "./.git/*" -exec dirname {} \; | sort -u | sed 's/^/-F/')
-          
-          # Note: Direct dynamic library compilation via AppleClang with @rpath install_name; works for standalone ESign/TrollStore dylib injection without Theos
+
+          # Note: Direct dynamic library compilation via AppleClang with @rpath install_name; works for standalone ESign/TrollStore dylib injection
           xcrun -sdk iphoneos clang++ -arch arm64 \
             -dynamiclib \
             -isysroot "$SDK_PATH" \
@@ -102,7 +115,7 @@ jobs:
             -framework SystemConfiguration \
             -framework WebKit \
             -o build_out/OkLilw.dylib
-            
+
           strip -x build_out/OkLilw.dylib
           ldid -S build_out/OkLilw.dylib || codesign -f -s - build_out/OkLilw.dylib
 
@@ -110,11 +123,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifacts_output
-          
-          # Extract .dylib from Theos obj/ or stage/ directories, or direct build_out/
-          find . -type f -name "*.dylib" -not -path "./artifacts_output/*" -exec cp -v {} artifacts_output/ \;
+          find . -type f -name "*.dylib" -not -path "./artifacts_output/*" -not -path "*/theos/*" -exec cp -v {} artifacts_output/ \;
           find . -type f -name "*.deb" -not -path "./artifacts_output/*" -exec cp -v {} artifacts_output/ \;
-          
+
           ls -la artifacts_output/
           if [ -z "$(ls -A artifacts_output/)" ]; then
             echo "Error: No .dylib or .deb produced!"
