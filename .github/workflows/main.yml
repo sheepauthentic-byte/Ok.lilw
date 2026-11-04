@@ -3,9 +3,9 @@ name: Build iOS Dylib
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
   workflow_dispatch:
 
 jobs:
@@ -21,37 +21,42 @@ jobs:
       - name: Setup Theos, ldid & iOS SDK Environment
         shell: bash
         run: |
-          set -e
-          export THEOS=$RUNNER_TEMP/theos
-          echo "THEOS=$THEOS" >> $GITHUB_ENV
-          echo "$THEOS/bin" >> $GITHUB_PATH
+          set -euo pipefail
 
-          # Note: Clones Theos and pulls patched iOS SDKs supporting private frameworks; bypasses missing stock Xcode private headers
+          export THEOS="$RUNNER_TEMP/theos"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+
+          # Clone Theos and install the iOS SDKs.
           git clone --recursive --depth=1 https://github.com/theos/theos.git "$THEOS"
-          curl -sL https://github.com/theos/sdks/archive/master.tar.gz | tar -xzf - -C "$THEOS/sdks" --strip-components=1
+          mkdir -p "$THEOS/sdks"
+          curl -fL https://github.com/theos/sdks/archive/master.tar.gz \
+            | tar -xzf - -C "$THEOS/sdks" --strip-components=1
 
-          # Note: Installs prebuilt Procursus ldid binary directly into $THEOS/bin and validates execution; avoids Homebrew dpkg/fakeroot overhead and exit code 1
-          curl -fSL https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_universal -o "$THEOS/bin/ldid"
-          chmod +x "$THEOS/bin/ldid"
-          
-          # Remove macOS quarantine attribute if present and verify binary exists
-          xattr -c "$THEOS/bin/ldid" 2>/dev/null || true
-          ls -la "$THEOS/bin/ldid"
+          # Install ldid from Homebrew instead of the release URL that returned 404.
+          if ! command -v ldid >/dev/null 2>&1; then
+            brew install ldid
+          fi
+
+          LDID_PATH="$(command -v ldid)"
+          ln -sf "$LDID_PATH" "$THEOS/bin/ldid"
+          "$THEOS/bin/ldid" -version || true
 
       - name: Verify Toolchain & Locate Build Root
         id: locate
         shell: bash
         run: |
-          # Note: Dynamically finds the directory containing Makefile if nested in a subfolder; prevents failure when repo root is a wrapper
-          MAKEFILE_PATH=$(find . -maxdepth 3 -name "Makefile" -not -path "./.git/*" | head -n 1)
+          set -euo pipefail
+
+          MAKEFILE_PATH="$(find . -maxdepth 3 -name "Makefile" -not -path "./.git/*" | head -n 1)"
           if [ -n "$MAKEFILE_PATH" ]; then
-            BUILD_DIR=$(dirname "$MAKEFILE_PATH")
-            echo "mode=theos" >> $GITHUB_OUTPUT
-            echo "dir=$BUILD_DIR" >> $GITHUB_OUTPUT
+            BUILD_DIR="$(dirname "$MAKEFILE_PATH")"
+            echo "mode=theos" >> "$GITHUB_OUTPUT"
+            echo "dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
             echo "Found Makefile in: $BUILD_DIR"
           else
-            echo "mode=clang" >> $GITHUB_OUTPUT
-            echo "dir=." >> $GITHUB_OUTPUT
+            echo "mode=clang" >> "$GITHUB_OUTPUT"
+            echo "dir=." >> "$GITHUB_OUTPUT"
             echo "No Makefile found. Falling back to direct xcrun clang++ compilation."
           fi
 
@@ -60,7 +65,9 @@ jobs:
         working-directory: ${{ steps.locate.outputs.dir }}
         shell: bash
         run: |
-          # Note: Runs 'make all' instead of 'make package' to compile, strip, and ldid-sign the .dylib without invoking dpkg-deb or fakeroot
+          set -euo pipefail
+
+          # Build the dylib without invoking dpkg-deb or fakeroot.
           make clean
           make all FINALPACKAGE=1 ARCHS="arm64" \
             THEOS_LDID="$THEOS/bin/ldid" \
@@ -71,14 +78,21 @@ jobs:
         if: steps.locate.outputs.mode == 'clang'
         shell: bash
         run: |
-          mkdir -p build_out
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          SOURCES=$(find . -type f \( -name "*.mm" -o -name "*.cpp" -o -name "*.m" -o -name "*.c" \) -not -path "./.git/*" -not -path "./build_out/*")
-          INCLUDES=$(find . -type f \( -name "*.h" -o -name "*.hpp" \) -not -path "./.git/*" -exec dirname {} \; | sort -u | sed 's/^/-I/')
-          STATIC_LIBS=$(find . -type f -name "*.a" -not -path "./.git/*")
-          FRAMEWORK_DIRS=$(find . -type d -name "*.framework" -not -path "./.git/*" -exec dirname {} \; | sort -u | sed 's/^/-F/')
+          set -euo pipefail
 
-          # Note: Direct dynamic library compilation via AppleClang with @rpath install_name; works for standalone ESign/TrollStore dylib injection
+          mkdir -p build_out
+          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          SOURCES="$(find . -type f \( -name "*.mm" -o -name "*.cpp" -o -name "*.m" -o -name "*.c" \) -not -path "./.git/*" -not -path "./build_out/*")"
+          INCLUDES="$(find . -type f \( -name "*.h" -o -name "*.hpp" \) -not -path "./.git/*" -exec dirname {} \; | sort -u | sed 's/^/-I/')"
+          STATIC_LIBS="$(find . -type f -name "*.a" -not -path "./.git/*")"
+          FRAMEWORK_DIRS="$(find . -type d -name "*.framework" -not -path "./.git/*" -exec dirname {} \; | sort -u | sed 's/^/-F/')"
+
+          if [ -z "$SOURCES" ]; then
+            echo "Error: No source files (.mm, .cpp, .m, or .c) were found."
+            exit 1
+          fi
+
+          # Compile an arm64 iOS dynamic library.
           xcrun -sdk iphoneos clang++ -arch arm64 \
             -dynamiclib \
             -isysroot "$SDK_PATH" \
@@ -105,15 +119,19 @@ jobs:
             -o build_out/OkLilw.dylib
 
           strip -x build_out/OkLilw.dylib
-          "$THEOS/bin/ldid" -S build_out/OkLilw.dylib || codesign -f -s - build_out/OkLilw.dylib
+          "$THEOS/bin/ldid" -S build_out/OkLilw.dylib \
+            || codesign -f -s - build_out/OkLilw.dylib
 
-      - name: Collect & Re-Verify Compiled Dylib
+      - name: Collect & Verify Compiled Dylib
         shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p artifacts_output
-          
-          # Note: Collects compiled .dylib from .theos/obj/arm64/ or build_out/ and ensures ad-hoc signature is intact
-          find . -type f -name "*.dylib" -not -path "./artifacts_output/*" -not -path "*/theos/*" -exec cp -v {} artifacts_output/ \;
+          find . -type f -name "*.dylib" \
+            -not -path "./artifacts_output/*" \
+            -not -path "*/theos/*" \
+            -exec cp -v {} artifacts_output/ \;
 
           ls -la artifacts_output/
           if [ -z "$(ls -A artifacts_output/)" ]; then
